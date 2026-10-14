@@ -1,0 +1,215 @@
+package com.sbi.categorization.controller;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+
+import com.sbi.categorization.DAO.CategorizationDao;
+import com.sbi.categorization.configuration.ExtractProperties;
+import com.sbi.categorization.dto.Category;
+import com.sbi.categorization.utils.DocLogger;
+import com.sbi.constants.FilePaths;
+
+/**
+ * Optimized categorization controller.
+ *
+ * Key changes vs original:
+ *  1. Parallel processing across LCPC folders (thread pool sized to LCPC count, capped).
+ *  2. Batch-limited customer-folder fetch per LCPC per run (DirectoryStream + limit),
+ *     instead of File.list() which loads every entry into memory up front.
+ *  3. Per-customer-folder try/catch so one bad folder doesn't kill the batch or the thread.
+ *  4. Thread-safe DAO/logging calls assumed (see note at bottom).
+ */
+@Controller
+public class CategorizationController {
+
+    private static final Logger log = (Logger) LogManager.getLogger(CategorizationController.class);
+
+    // Tune these two based on DB/disk load. Keep pool size <= number of LCPC folders.
+    private static final int LCPC_THREAD_POOL_SIZE = Integer.parseInt(FilePaths.ThreadCount);//8;
+    private static final int BATCH_SIZE_PER_LCPC =Integer.parseInt(FilePaths.BatchSize); //50; // customer folders processed per LCPC per run
+
+    private final String inputPath=FilePaths.inputFolder;
+    private final String categorizedInput=FilePaths.CATEGORIZED_INPUT;
+    private final String exceptionPath=FilePaths.EXCEPTION;
+    
+    public static String CATEGORIZED_INPUT = FilePaths.CATEGORIZED_INPUT;
+	public static String EXCEPTION = FilePaths.EXCEPTION;
+	public static String docFilePath = FilePaths.docFilePath;
+	public static String docFilePathExp = FilePaths.docFilePathExp;
+	public static String ResFilePath = FilePaths.ResFilePath;
+    private final List<String> categoryList=Arrays.asList(ExtractProperties.getInstance().getProperty("categories").split("\\,"));
+    
+    @Autowired
+    private CategorizationDao categorizationDao;
+
+
+    public void doCategorization() throws InterruptedException {
+        String[] lcpcNames = ExtractProperties.getInstance().getProperty("LCPC_NAMES").split(",");
+        log.info("No of LCPC folders fetched: " + lcpcNames.length);
+
+        int poolSize = Math.min(LCPC_THREAD_POOL_SIZE, lcpcNames.length);
+        ExecutorService executor = Executors.newFixedThreadPool(poolSize);
+        AtomicInteger totalProcessed = new AtomicInteger(0);
+
+        List<Future<?>> futures = new java.util.ArrayList<>();
+        for (String lcpcName : lcpcNames) {
+            futures.add(executor.submit(() -> processLcpcFolder(lcpcName.trim(), totalProcessed)));
+        }
+
+        executor.shutdown();
+        // Wait for all LCPC folders to finish (bounded wait; adjust timeout as needed)
+        for (Future<?> f : futures) {
+            try {
+                f.get();
+            } catch (ExecutionException e) {
+                log.error("LCPC folder processing failed", e.getCause());
+            }
+        }
+        log.info("Run complete. Total customer folders processed: " + totalProcessed.get());
+    }
+
+    /**
+     * Processes ONE LCPC folder: fetches at most BATCH_SIZE_PER_LCPC customer
+     * folders (not the whole directory) and categorizes each.
+     */
+    private void processLcpcFolder(String lcpcName, AtomicInteger totalProcessed) {
+    	
+    	log.info("totalProcessed: " + totalProcessed);
+    	
+        Path lcpcFolder = Path.of(inputPath, lcpcName);
+        
+        log.info("Files.isDirectory(lcpcFolder): " + Files.isDirectory(lcpcFolder));
+
+        if (!Files.isDirectory(lcpcFolder)) {
+            log.info("LCPC folder missing or not a directory: " + lcpcFolder);
+            return;
+        }
+
+        int fetchedInThisLcpc = 0;
+
+        // DirectoryStream avoids loading every filename into memory at once,
+        // and we bail out as soon as we hit the batch cap.
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(lcpcFolder)) {
+            for (Path customerPath : stream) {
+                if (fetchedInThisLcpc >= BATCH_SIZE_PER_LCPC) {
+                    log.info("Batch cap (" + BATCH_SIZE_PER_LCPC + ") reached for LCPC: " + lcpcName + " — remaining folders will run next cycle.");
+                    break;
+                }
+                fetchedInThisLcpc++;
+
+                try {
+                    processCustomerFolder(customerPath.toFile(), lcpcName);
+                    totalProcessed.incrementAndGet();
+                } catch (Exception e) {
+                    // Isolate failure to this one folder — do not abort the LCPC batch.
+                    log.error("Failed processing customer folder: " + customerPath, e);
+                }
+            }
+        } catch (IOException e) {
+            log.error("Error listing LCPC folder: " + lcpcFolder, e);
+        }
+
+        log.info("LCPC [" + lcpcName + "] — customer folders processed this run: " + fetchedInThisLcpc);
+    }
+
+    /**
+     * Core per-customer-folder logic, equivalent to your original inner loop body.
+     */
+    private void processCustomerFolder(File customerFold, String lcpcName) throws IOException {
+        String name = customerFold.getName();
+        String[] parts = name.split("_");
+        if (parts.length < 3) {
+            log.warn("Unexpected folder name format, skipping: " + name);
+            return;
+        }
+        String cif = parts[0];
+        String acc = parts[2];
+
+        Category category = categorizationDao.checkcategory(acc, cif);
+        log.info("cif=" + cif + " acc=" + acc + " lcpc=" + category.lcpc()+ " category=" + category.category());
+
+        boolean categoryInvalid = category.category() == null
+                || category.category().isEmpty()
+                  || !categoryList.contains(category.category());
+
+        if (categoryInvalid) {
+            boolean lcpcMissing = category.lcpc() == null || category.lcpc().isEmpty();
+            if (lcpcMissing) {
+                moveToException(customerFold, lcpcName, "CATEGORY NULL IN DB");
+                DocLogger.docWriter("CATEGORY NULL IN DB", name, category.lcpc(),docFilePathExp);
+                categorizationDao.HistoryInsert(cif, acc, lcpcName, "CATEGORY NULL IN DB");
+            }
+            return;
+        }
+        
+        String categoryLcpc = category.lcpc()==null?"":category.lcpc();
+        log.info("category Lcpc: " + categoryLcpc);
+        
+        // Category is valid — check LCPC name match
+        if (!categoryLcpc.equalsIgnoreCase(lcpcName)) {
+            moveToException(customerFold, category.lcpc(), "LCPC NAME MISMATCH");
+            DocLogger.docWriter("LCPC NAME MISMATCH", name, category.lcpc(),docFilePathExp);
+            categorizationDao.HistoryInsert(cif, acc, lcpcName, "LCPC NAME MISMATCH");
+            return; // folder already moved out — nothing left to categorize
+        }
+
+        // Happy path — move into category folder
+        Path categoryFold = Path.of(categorizedInput, category.category(),category.lcpc(), name);
+        Files.createDirectories(categoryFold.getParent());
+        deleteIfExists(categoryFold);
+        Files.move(customerFold.toPath(), categoryFold, StandardCopyOption.REPLACE_EXISTING);
+
+        log.info("File moved to category: " + categoryFold);
+        DocLogger.docWriter("SUCCESS", name, category.lcpc(),docFilePath);
+        categorizationDao.updateStatus(cif,acc);
+        categorizationDao.HistoryInsert(cif, acc, lcpcName, "SUCCESS");
+    }
+
+    private void moveToException(File customerFold, String lcpcName, String reason) throws IOException {
+        Path exceptionFold = Path.of(exceptionPath, lcpcName, customerFold.getName());
+        Files.createDirectories(exceptionFold.getParent());
+        deleteIfExists(exceptionFold);
+        Files.move(customerFold.toPath(), exceptionFold, StandardCopyOption.REPLACE_EXISTING);
+        log.info(reason + " — moved " + customerFold.getName() + " to " + exceptionFold);
+    }
+    
+    private void deleteIfExists(Path processing) {
+		if (processing == null || !Files.exists(processing)) return; 
+		try {
+			Files.walkFileTree(processing, new SimpleFileVisitor<Path>() {
+				@Override
+				public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+					Files.delete(file);
+					return FileVisitResult.CONTINUE;
+				}
+				@Override
+				public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+					if (exc != null) throw exc;
+					Files.delete(dir);
+					return FileVisitResult.CONTINUE;
+				}
+			});
+		} catch (IOException e) {
+			throw new RuntimeException("Failed to delete folder: " + processing, e);
+		}
+		log.info("removed: " + processing.toString());
+	}
+
+  
+}
