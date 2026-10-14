@@ -1,0 +1,5 @@
+package com.sbi.categorization.dto;
+
+public record Category(String category, String lcpc) {
+
+}
