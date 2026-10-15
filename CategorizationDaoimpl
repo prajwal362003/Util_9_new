@@ -1,0 +1,86 @@
+package com.sbi.categorization.DAOImpl;
+
+import java.text.SimpleDateFormat;
+
+import com.sbi.categorization.DAO.*;
+import com.sbi.categorization.configuration.ExtractProperties;
+import com.sbi.categorization.dto.Category;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.Logger;
+
+@Repository
+public class CategorizationDaoimpl implements CategorizationDao{
+	private static final Logger log = (Logger) LogManager.getLogger(CategorizationDaoimpl.class);
+	private static final JdbcTemplate jdbcTemplate = new JdbcTemplate(com.connection.DatabaseConfiguration.getDataSource());
+	private static String pocCategorySql = ExtractProperties.getInstance().getProperty("POC_CATEGORY");
+	private static String historyInsert = ExtractProperties.getInstance().getProperty("HISTORY_INSERT");
+	static SimpleDateFormat dateFormatformat = new SimpleDateFormat("ddMMyyyy");
+
+
+	@Override
+	public Category checkcategory(String acc, String cif) {
+		
+		log.info("CheckCategorySql : " + pocCategorySql);
+		
+		String formattedCif = padWithZeros(cif, 17);
+		String formattedAcc = padWithZeros(acc, 17);
+
+		log.info("Inside checkcategory method for CIF: {}", formattedCif);
+//SELECT CATEGARY , LCPC FROM KYC_PERFIOS_CUSTOMER_DETAILS WHERE CIF_NUMBER=? AND ACCOUNT_NUMBER=?
+		try {
+			 RowMapper<Category> rowMapper = (rs, rowNum) -> 
+		        new Category(rs.getString("CATEGORIZATION"), rs.getString("LCPC_CODE"));
+		       // log.info("Result Statement set");
+		    return jdbcTemplate.query(pocCategorySql, rowMapper, formattedCif, formattedAcc)
+		            .stream()
+		            .findFirst()
+		            .orElse(new Category("", ""));
+
+		} catch (Exception e) {
+			log.error("Error occurred while fetching category", e);
+			return new Category("",""); // Return safe default
+		}	
+	}
+	
+	@Override
+	public void HistoryInsert(String cif, String acc, String lcpc, String remark)
+	{
+		
+		log.info("HistoryInsertSql : " + historyInsert);
+		//HISTORY_INSERT=INSERT INTO KYC_PERFIOS_HISTORY (CIF_NUMBER, ACCOUNT_NUMBER, REMARK, UTILITY_NO, LCPC, MODIFIED_DATE ) values (?,?,?,?,?,sysdate)
+		try {
+			int a=jdbcTemplate.update(historyInsert,cif,acc,remark,"Utility_9_Segregation");
+			log.info("No of rows inserted : "+a);
+		}catch(Exception e) {
+			log.error("Error inserting values",e);
+		}
+	}
+
+	private String padWithZeros(String input, int length) {
+		if (input == null) input = "";
+		StringBuilder sb = new StringBuilder(input);
+		while (sb.length() < length) {
+			sb.insert(0, "0");
+		}
+		return sb.toString();
+	}
+
+	
+
+	@Override
+	public void updateStatus(String cif, String acc) {
+		String sql = ExtractProperties.getInstance().getProperty("POC_DATA");
+		log.info("UpdateStatusSql " + sql);		    
+		try {
+			int rowsAffected = jdbcTemplate.update(sql, cif, acc);
+			log.info("Number of rows updated " + rowsAffected);
+		}catch(Exception e) {
+			log.error("Error updating records",e.getMessage());
+		}
+
+	}
+
+}
