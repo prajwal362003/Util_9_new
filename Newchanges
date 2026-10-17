@@ -1,1 +1,62 @@
 
+private static String fetchPendingSql = ExtractProperties.getInstance().getProperty("FETCH_PENDING_SQL");
+
+@Override
+public List<AccountDetail> fetchPendingRecords(String lcpc, int limit) {
+    log.info("FetchPendingSql : " + fetchPendingSql);
+    log.info("fetchPendingRecords lcpc=" + lcpc + " limit=" + limit);
+    try {
+        RowMapper<AccountDetail> rowMapper = (rs, i) -> new AccountDetail(
+                rs.getString("CIF_NUMBER"), rs.getString("ACCOUNT_NUMBER"),
+                rs.getString("BRANCH_CODE"), rs.getString("LCPC"),
+                rs.getString("CIF_STATUS"), rs.getString("CATEGORY"));
+
+        List<AccountDetail> rows = jdbcTemplate.query(fetchPendingSql, rowMapper, lcpc);
+        log.info("fetchPendingRecords rows found: " + rows.size());
+
+        // same account can come back more than once: keep one row, worst colour wins
+        Map<String, AccountDetail> unique = new LinkedHashMap<>();
+        for (AccountDetail r : rows) {
+            String key = r.cifNumber() + "_" + r.accountNumber();
+            AccountDetail old = unique.get(key);
+            if (old == null || rank(r.category()) > rank(old.category())) {
+                unique.put(key, r);
+            }
+        }
+        List<AccountDetail> result = new ArrayList<>(unique.values());
+        return result.size() > limit ? new ArrayList<>(result.subList(0, limit)) : result;
+
+    } catch (Exception e) {
+        log.error("Error occurred while fetching pending records (SQL failed): " + e.getMessage(), e);
+        return new ArrayList<>();
+    }
+}
+
+private static int rank(String c) {
+    if (c == null) return 0;
+    String v = c.trim().toLowerCase();
+    return v.equals("red") ? 3 : v.equals("orange") ? 2 : v.equals("green") ? 1 : 0;
+}
+
+
+private void processLcpcRecords(String lcpcName, AtomicInteger totalProcessed) {
+
+    List<AccountDetail> records = categorizationDao.fetchPendingRecords(lcpcName, BATCH_SIZE_PER_LCPC);
+
+    if (records == null || records.isEmpty()) {
+        log.info("No records found for LCPC: " + lcpcName);
+        return;
+    }
+    log.info("Fetched " + records.size() + " records for LCPC: " + lcpcName);
+
+    for (AccountDetail record : records) {
+        try {
+            if (processCustomerRecord(record, lcpcName)) {
+                totalProcessed.incrementAndGet();
+            }
+        } catch (Exception e) {
+            log.error("Error processing CIF=" + record.cifNumber()
+                    + ", account=" + record.accountNumber(), e);
+        }
+    }
+}
