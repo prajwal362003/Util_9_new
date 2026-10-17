@@ -1,0 +1,155 @@
+SELECT a.cif_status, a.cif_number, a.branch_code, a.account_number, a.lcpc, b.category
+FROM kycupdate.kyc_perfios_customer_details a
+INNER JOIN kycupdate.rekyc_perfios_summery_details b ON a.cif_number = b.cif_number
+WHERE a.cif_status = 'ZC' AND b.lcpc IS NOT NULL AND a.lcpc = ?
+  AND b.category IN ('red','orange','green')
+FETCH FIRST 50 ROWS ONLY
+
+
+private static final String FETCH_PENDING_SQL =
+        "SELECT * FROM ( "
+        + " SELECT x.*, ROWNUM rn FROM ( "
+        + "  SELECT a.cif_status, a.cif_number, a.branch_code, a.account_number, a.lcpc, "
+        + "         CASE MAX(CASE UPPER(TRIM(b.categorization)) "
+        + "                    WHEN 'RED' THEN 3 WHEN 'ORANGE' THEN 2 WHEN 'GREEN' THEN 1 ELSE 0 END) "
+        + "              WHEN 3 THEN 'RED' WHEN 2 THEN 'ORANGE' WHEN 1 THEN 'GREEN' END AS category "
+        + "  FROM kycupdate.kyc_perfios_customer_details a "
+        + "  INNER JOIN kycupdate.REKYC_PERFIOS_SUMMARY_TABLE b "
+        + "          ON a.cif_number = b.cif_number AND a.account_number = b.account_number "
+        + "  WHERE a.cif_status = 'ZC' "
+        + "    AND a.lcpc = ? "
+        + "    AND UPPER(TRIM(b.categorization)) IN ('RED','ORANGE','GREEN') "
+        + "  GROUP BY a.cif_status, a.cif_number, a.branch_code, a.account_number, a.lcpc "
+        + "  ORDER BY a.cif_number, a.account_number "
+        + " ) x WHERE ROWNUM <= ? "
+        + ") WHERE rn > ?";
+
+@Override
+public List<AccountDetail> fetchPendingRecords(String lcpc, int offset, int limit) {
+    log.info("fetchPendingRecords lcpc=" + lcpc + " offset=" + offset + " limit=" + limit);
+    try {
+        RowMapper<AccountDetail> rowMapper = (rs, rowNum) -> new AccountDetail(
+                rs.getString("CIF_NUMBER"),
+                rs.getString("ACCOUNT_NUMBER"),
+                rs.getString("BRANCH_CODE"),
+                rs.getString("LCPC"),
+                rs.getString("CIF_STATUS"),
+                rs.getString("CATEGORY"));
+
+        List<AccountDetail> rows = jdbcTemplate.query(FETCH_PENDING_SQL, rowMapper, lcpc, offset + limit, offset);
+        log.info("fetchPendingRecords rows found: " + rows.size());
+        return rows;
+    } catch (Exception e) {
+        log.error("Error occurred while fetching pending records (SQL failed): " + e.getMessage(), e);
+        return new ArrayList<>();
+    }
+}
+
+
+futures.add(executor.submit(() -> processLcpcRecords(lcpcName.trim(), totalProcessed)));
+
+
+
+private void processLcpcRecords(String lcpcName, AtomicInteger totalProcessed) {
+
+    int movedInThisLcpc = 0;
+    int stillPending = 0; // failed/not-found rows stay 'ZC', so the next page starts after them
+
+    while (movedInThisLcpc < BATCH_SIZE_PER_LCPC) {
+
+        List<AccountDetail> records = categorizationDao.fetchPendingRecords(
+                lcpcName, stillPending, BATCH_SIZE_PER_LCPC - movedInThisLcpc);
+
+        if (records == null || records.isEmpty()) {
+            break;
+        }
+        log.info("Fetched " + records.size() + " records for LCPC: " + lcpcName);
+
+        for (AccountDetail record : records) {
+            boolean moved = false;
+            try {
+                moved = processCustomerRecord(record, lcpcName);
+            } catch (Exception e) {
+                log.error("Error processing CIF=" + record.cifNumber()
+                        + ", account=" + record.accountNumber(), e);
+            }
+            if (moved) {
+                movedInThisLcpc++;
+                totalProcessed.incrementAndGet();
+            } else {
+                stillPending++;
+            }
+        }
+    }
+    log.info("LCPC [" + lcpcName + "] — customer folders moved this run: " + movedInThisLcpc
+            + ", left pending: " + stillPending);
+}
+
+private boolean processCustomerRecord(AccountDetail record, String sourceLcpc) throws IOException {
+
+    String cif = record.cifNumber();
+    String acc = record.accountNumber();
+    String categoryLcpc = record.lcpc();
+
+    String folderName = getFolderName(cif, record.branchCode(), acc);
+    Path sourceFolder = Path.of(inputPath, sourceLcpc, folderName);
+    log.info("Processing folder: " + sourceFolder + " category=" + record.category() + " lcpc=" + categoryLcpc);
+
+    // STEP 1: source folder must exist
+    if (!Files.isDirectory(sourceFolder)) {
+        log.warn("SOURCE FOLDER NOT FOUND: " + sourceFolder);
+        return false;
+    }
+
+    // STEP 2: category must be in the "categories" property (ignoring case)
+    String dbCategory = record.category() == null ? "" : record.category().trim();
+    String matchedCategory = categoryList.stream()
+            .map(String::trim)
+            .filter(c -> c.equalsIgnoreCase(dbCategory))
+            .findFirst()
+            .orElse(null);
+
+    if (matchedCategory == null) {
+        log.warn("INVALID CATEGORY IN DB [" + dbCategory + "] for " + folderName + ", allowed: " + categoryList);
+        categorizationDao.HistoryInsert(cif, acc, sourceLcpc, "INVALID CATEGORY IN DB");
+        return false;
+    }
+
+    // STEP 3: LCPC checks
+    if (categoryLcpc == null || categoryLcpc.trim().isEmpty()) {
+        log.warn("LCPC NULL IN DB for " + folderName);
+        categorizationDao.HistoryInsert(cif, acc, sourceLcpc, "LCPC NULL IN DB");
+        return false;
+    }
+    if (!categoryLcpc.trim().equalsIgnoreCase(sourceLcpc)) {
+        log.warn("LCPC NAME MISMATCH for " + folderName + ": " + categoryLcpc + " vs " + sourceLcpc);
+        categorizationDao.HistoryInsert(cif, acc, sourceLcpc, "LCPC NAME MISMATCH");
+        return false;
+    }
+
+    // STEP 4: move to CATEGORY_INPUT_FOLD/<colour>/<LCPC>/<folder>
+    Path destinationFolder = Path.of(categorizedInput, matchedCategory, categoryLcpc.trim(), folderName);
+    Files.createDirectories(destinationFolder.getParent());
+    deleteIfExists(destinationFolder);
+    Files.move(sourceFolder, destinationFolder, StandardCopyOption.REPLACE_EXISTING);
+    log.info("File moved to category: " + destinationFolder);
+
+    // STEP 5: status + history + doc log
+    categorizationDao.updateStatus(cif, acc);
+    categorizationDao.HistoryInsert(cif, acc, sourceLcpc, "SUCCESS");
+    DocLogger.docWriter("SUCCESS", folderName, categoryLcpc.trim(), docFilePath);
+    return true;
+}
+
+// CIF_BRANCH_ACCOUNT, zero padded like the folders: 17 _ 5 _ 17
+private static String getFolderName(String cif, String branch, String account) {
+    return padWithZeros(cif, 17) + "_" + padWithZeros(branch, 5) + "_" + padWithZeros(account, 17);
+}
+
+private static String padWithZeros(String input, int length) {
+    StringBuilder sb = new StringBuilder(input == null ? "" : input.trim());
+    while (sb.length() < length) {
+        sb.insert(0, "0");
+    }
+    return sb.toString();
+}
