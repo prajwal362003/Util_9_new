@@ -1,0 +1,174 @@
+Query = “select a.cif_status,
+			a.cif_number,
+			a.branch_code,
+			a.account_number,
+			a.lcpc,
+			b.category
+		from kycupdate.kyc_perfios_customer_details a
+			inner join 
+				kycupdate.rekyc_perfios_summery_details b
+			on a.cif_number = b.cif_number
+		where 
+			a.cif_status = ‘ZC’
+			and b.lcpc is not null
+			and a.lcpc=:inputLCPC
+			and category in (‘red’,’orange’,’green’)
+			limit 50;
+”
+
+
+
+
+public record AccountDetail( String cifNumber, String accountNumber, String branchCode, String lcpc, String cifStatus, String category ) {}
+
+
+
+
+
+private void processLcpcRecords(
+        String lcpcName,
+        AtomicInteger totalProcessed) {
+
+    List<CategorizationRecord> records =
+            categorizationDao.fetchPendingRecords(
+                    lcpcName, BATCH_SIZE_PER_LCPC);
+
+    if (records == null || records.isEmpty()) {
+        log.info("No records found for LCPC: " + lcpcName);
+        return;
+    }
+
+    log.info("Fetched " + records.size()
+            + " records for LCPC: " + lcpcName);
+
+    for (CategorizationRecord record : records) {
+        try {
+            processCustomerRecord(record, lcpcName);
+            totalProcessed.incrementAndGet();
+
+        } catch (Exception e) {
+            log.error("Error processing CIF="
+                    + record.getCifNumber()
+                    + ", account=" + record.getAccountNumber(), e);
+        }
+    }
+}
+
+
+
+
+
+
+
+private void processCustomerRecord(
+        CategorizationRecord record,
+        String sourceLcpc) throws IOException {
+
+    String cif = record.getCifNumber();
+    String acc = record.getAccountNumber();
+    String category = record.getCategory();
+    String categoryLcpc = record.getLcpc();
+
+    // Construct folder name: CIF_BRANCH_ACCOUNT
+    String folderName = getFolderName();
+
+    // Source: inputFolder/LCPC/CIF_BRANCH_ACCOUNT
+    Path sourceFolder = Path.of(
+            inputPath, sourceLcpc, folderName);
+
+    log.info("Processing folder: " + sourceFolder);
+
+    // STEP 1: Check whether the source folder exists.
+    if (!Files.isDirectory(sourceFolder)) {
+
+        String remark = "SOURCE FOLDER NOT FOUND";
+
+        log.warn(remark + ": " + sourceFolder);
+
+        categorizationDao.updateRemark(cif, acc, remark);
+
+        categorizationDao.HistoryInsert(
+                cif, acc, sourceLcpc, remark);
+
+        return;
+    }
+
+    // STEP 2: Validate the category from the database.
+    if (category == null
+            || category.trim().isEmpty()
+            || !categoryList.contains(category)) {
+
+        String remark = "INVALID CATEGORY IN DB";
+
+        categorizationDao.updateRemark(cif, acc, remark);
+
+        categorizationDao.HistoryInsert(
+                cif, acc, sourceLcpc, remark);
+
+        return;
+    }
+
+    // STEP 3: Validate the destination LCPC.
+    if (categoryLcpc == null
+            || categoryLcpc.trim().isEmpty()) {
+
+        String remark = "LCPC NULL IN DB";
+
+        categorizationDao.updateRemark(cif, acc, remark);
+
+        categorizationDao.HistoryInsert(
+                cif, acc, sourceLcpc, remark);
+
+        return;
+    }
+
+    if (!categoryLcpc.equalsIgnoreCase(sourceLcpc)) {
+
+        String remark = "LCPC NAME MISMATCH";
+
+        categorizationDao.updateRemark(cif, acc, remark);
+
+        categorizationDao.HistoryInsert(
+                cif, acc, sourceLcpc, remark);
+
+        return;
+    }
+
+    // STEP 4: Move the folder to the category output directory.
+    Path destinationFolder = Path.of(
+            categorizedInput,
+            category,
+            categoryLcpc,
+            folderName);
+
+    Files.createDirectories(destinationFolder.getParent());
+
+    // Remove any existing destination folder.
+    deleteIfExists(destinationFolder);
+
+    Files.move(
+            sourceFolder,
+            destinationFolder,
+            StandardCopyOption.REPLACE_EXISTING);
+
+    log.info("Successfully moved folder to: "
+            + destinationFolder);
+
+    // STEP 5: Update database status and history.
+    categorizationDao.updateStatus(cif, acc);
+
+    categorizationDao.HistoryInsert(
+            cif, acc, sourceLcpc, "SUCCESS");
+
+    DocLogger.docWriter(
+            "SUCCESS", folderName, categoryLcpc, docFilePath);
+}
+
+
+
+
+
+
+Private static String getFolderName(cif,account, branch){
+	return cif+”_”+branch+”_”+account;
+}
