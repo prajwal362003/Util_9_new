@@ -1,0 +1,24 @@
+// CategorizationDao
+void updateCategory(String cif, String acc, String category);
+
+
+//CategorizationDaoImpl
+@Override
+public void updateCategory(String cif, String acc, String category) {
+    String sql = "UPDATE kycupdate.kyc_perfios_customer_details SET categary = ? "
+               + "WHERE cif_number = ? AND account_number = ?";
+    try {
+        int rows = jdbcTemplate.update(sql, category, cif, acc);
+        log.info("updateCategory rows updated: " + rows + " category=" + category);
+    } catch (Exception e) {
+        log.error("Error updating category for CIF=" + cif + ", account=" + acc, e);
+    }
+}
+
+
+
+// Controller
+categorizationDao.updateStatus(cif, acc);
+categorizationDao.updateCategory(cif, acc, matchedCategory);   // new
+categorizationDao.HistoryInsert(cif, acc, sourceLcpc, "SUCCESS");
+
